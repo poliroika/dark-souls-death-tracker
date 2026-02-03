@@ -2,30 +2,23 @@
 Dark Souls Death Counter
 Автоматический счётчик смертей
 
-Методы детекции:
-1. Экран - ищет красный текст "Вы погибли"
-2. Звук - слушает характерный звук смерти
+Детекция по шаблону - ищет картинку "ВЫ ПОГИБЛИ" (death.png) на экране.
 """
 
 import tkinter as tk
 import json
 import time
 import threading
+import ctypes
 from pathlib import Path
 
 try:
     import mss
-    from PIL import Image
+    import cv2
+    import numpy as np
     SCREEN_OK = True
 except ImportError:
     SCREEN_OK = False
-
-try:
-    import sounddevice as sd
-    import numpy as np
-    SOUND_OK = True
-except ImportError:
-    SOUND_OK = False
 
 try:
     import win32gui
@@ -35,69 +28,59 @@ except ImportError:
     WIN32_OK = False
 
 SAVE_FILE = Path(__file__).parent / "death_count.json"
+TEMPLATE_FILE = Path(__file__).parent / "death.png"
 
 
 class DeathDetector:
-    """Детектор смерти по экрану и звуку"""
+    """Детектор смерти по шаблону изображения"""
     
     def __init__(self):
         self.last_death_time = 0
-        self.cooldown = 4.0  # Секунд между смертями
+        self.cooldown = 15.0  # Секунд паузы после смерти
+        self.in_cooldown = False  # Флаг кулдауна
         
-        # Для звука
-        self.audio_buffer = []
-        self.sound_threshold = 0.15  # Порог громкости
-        self.loud_duration = 0
-        self.stream = None
-        
-        if SOUND_OK:
-            self._start_audio()
+        # Загружаем шаблон в разных масштабах
+        self.templates = []  # Список (template, scale)
+        self.debug_mode = True  # Показывать отладку
+        self.debug_counter = 0
+        self._load_template()
     
-    def _start_audio(self):
-        """Запустить захват аудио"""
+    def _load_template(self):
+        """Загрузить шаблон изображения смерти в разных масштабах"""
+        if not SCREEN_OK:
+            return
+        
+        if not TEMPLATE_FILE.exists():
+            print(f"[!] Файл шаблона не найден: {TEMPLATE_FILE}")
+            return
+        
         try:
-            def audio_callback(indata, frames, time_info, status):
-                # Вычисляем громкость
-                volume = np.sqrt(np.mean(indata**2))
-                self.audio_buffer.append(volume)
-                if len(self.audio_buffer) > 30:
-                    self.audio_buffer.pop(0)
+            # Загружаем оригинальный шаблон
+            template_orig = cv2.imread(str(TEMPLATE_FILE), cv2.IMREAD_GRAYSCALE)
+            if template_orig is None:
+                print("[!] Не удалось загрузить шаблон")
+                return
             
-            self.stream = sd.InputStream(
-                channels=1,
-                samplerate=22050,
-                blocksize=1024,
-                callback=audio_callback
-            )
-            self.stream.start()
-            print("[+] Аудио захват запущен")
+            h, w = template_orig.shape
+            print(f"[+] Шаблон загружен: {w}x{h}")
+            
+            # Создаём шаблоны разных размеров (от 50% до 200%)
+            scales = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0]
+            for scale in scales:
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                if new_w > 10 and new_h > 10:
+                    resized = cv2.resize(template_orig, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    self.templates.append((resized, scale))
+            
+            print(f"[+] Создано {len(self.templates)} масштабов шаблона")
+            
         except Exception as e:
-            print(f"[!] Не удалось запустить аудио: {e}")
-            self.stream = None
-    
-    def check_sound(self) -> bool:
-        """Проверить был ли громкий звук (смерть)"""
-        if not self.audio_buffer:
-            return False
-        
-        current_volume = np.mean(self.audio_buffer[-5:]) if len(self.audio_buffer) >= 5 else 0
-        avg_volume = np.mean(self.audio_buffer) if self.audio_buffer else 0
-        
-        # Если текущая громкость значительно выше средней
-        if current_volume > avg_volume * 2.5 and current_volume > self.sound_threshold:
-            self.loud_duration += 1
-            # Нужно несколько фреймов подряд громкого звука
-            if self.loud_duration >= 3:
-                self.loud_duration = 0
-                return True
-        else:
-            self.loud_duration = 0
-        
-        return False
+            print(f"[!] Ошибка загрузки шаблона: {e}")
     
     def check_screen(self) -> bool:
-        """Проверить экран на надпись смерти"""
-        if not SCREEN_OK:
+        """Проверить экран на наличие шаблона смерти"""
+        if not SCREEN_OK or not self.templates:
             return False
         
         try:
@@ -106,69 +89,83 @@ class DeathDetector:
                 width = monitor["width"]
                 height = monitor["height"]
                 
-                # Центр экрана где появляется "Вы погибли"
+                # Область поиска - только центр где появляется "ВЫ ПОГИБЛИ"
+                # Исключаем верхний UI (здоровье) и нижний UI (предметы, души)
                 region = {
-                    "left": width // 4,
-                    "top": height // 3,
-                    "width": width // 2,
-                    "height": height // 4
+                    "left": int(width * 0.25),      # 25% слева
+                    "top": int(height * 0.35),      # 35% сверху
+                    "width": int(width * 0.5),      # 50% ширины (центр)
+                    "height": int(height * 0.20)    # 20% высоты (узкая полоса)
                 }
                 
+                # Делаем скриншот
                 screenshot = sct.grab(region)
-                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
                 
-                # Считаем красные пиксели
-                red_count = 0
-                dark_red_count = 0
-                total = 0
+                # Конвертируем в numpy array для OpenCV
+                img = np.array(screenshot)
                 
-                pixels = img.load()
-                for x in range(0, img.width, 4):
-                    for y in range(0, img.height, 4):
-                        r, g, b = pixels[x, y]
-                        total += 1
-                        
-                        # Красный текст: R высокий, G и B низкие
-                        # Расширенный диапазон для разных версий
-                        if r > 100 and g < 60 and b < 60 and r > g + 60 and r > b + 60:
-                            red_count += 1
-                        
-                        # Тёмно-красный (некоторые версии)
-                        if 80 < r < 180 and g < 40 and b < 40:
-                            dark_red_count += 1
+                # Конвертируем BGRA -> Grayscale
+                gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
                 
-                # Если много красного - смерть
-                red_ratio = (red_count + dark_red_count) / total if total > 0 else 0
+                best_val = 0
+                best_scale = 0
                 
-                if red_ratio > 0.008:  # 0.8% красных пикселей
+                # Пробуем все масштабы шаблона
+                for template, scale in self.templates:
+                    # Проверяем что шаблон меньше изображения
+                    if template.shape[0] > gray.shape[0] or template.shape[1] > gray.shape[1]:
+                        continue
+                    
+                    # Ищем шаблон
+                    result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(result)
+                    
+                    if max_val > best_val:
+                        best_val = max_val
+                        best_scale = scale
+                
+                # Отладка - показываем каждые 25 проверок (~5 сек)
+                if self.debug_mode:
+                    self.debug_counter += 1
+                    if self.debug_counter >= 25:
+                        self.debug_counter = 0
+                        print(f"[DEBUG] Совпадение: {best_val:.1%} (масштаб {best_scale})")
+                
+                # Порог совпадения (повысил т.к. область теперь точнее)
+                threshold = 0.30  # 30%
+                
+                if best_val >= threshold:
+                    print(f"[!] Обнаружена смерть! Совпадение: {best_val:.1%}")
                     return True
                     
-        except:
-            pass
+        except Exception as e:
+            print(f"[!] Ошибка проверки экрана: {e}")
         
         return False
     
     def check_death(self) -> bool:
-        """Проверить смерть любым методом"""
-        if time.time() - self.last_death_time < self.cooldown:
+        """Проверить смерть с простым кулдауном"""
+        current_time = time.time()
+        time_since_death = current_time - self.last_death_time
+        
+        # Кулдаун после смерти - игнорируем все проверки
+        if self.in_cooldown:
+            if time_since_death >= self.cooldown:
+                self.in_cooldown = False
+                print("[*] Снова слежу за смертями...")
             return False
         
         # Проверяем экран
         if self.check_screen():
-            self.last_death_time = time.time()
-            return True
-        
-        # Проверяем звук
-        if SOUND_OK and self.check_sound():
-            self.last_death_time = time.time()
+            self.last_death_time = current_time
+            self.in_cooldown = True
+            print(f"[*] Пауза {int(self.cooldown)} сек (надпись на экране)...")
             return True
         
         return False
     
     def stop(self):
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
+        pass
 
 
 class DeathCounter:
@@ -177,6 +174,7 @@ class DeathCounter:
         self.root = None
         self.running = False
         self.detector = DeathDetector()
+        self.hwnd = None
         self.load()
     
     def load(self):
@@ -206,17 +204,19 @@ class DeathCounter:
     
     def _redraw(self):
         self.canvas.delete("all")
-        text = f"Смертей: {self.deaths}"
+        text = f"☠ {self.deaths}"
         x, y = 10, 25
         
-        for dx in [-2, 0, 2]:
-            for dy in [-2, 0, 2]:
+        # Тень для читаемости
+        for dx in [-2, -1, 0, 1, 2]:
+            for dy in [-2, -1, 0, 1, 2]:
                 if dx or dy:
                     self.canvas.create_text(x+dx, y+dy, text=text,
-                        font=('Arial', 24, 'bold'), fill='#000000', anchor='w')
+                        font=('Arial', 28, 'bold'), fill='#000000', anchor='w')
         
+        # Красный текст как в игре
         self.canvas.create_text(x, y, text=text,
-            font=('Arial', 24, 'bold'), fill='#FFFFFF', anchor='w')
+            font=('Arial', 28, 'bold'), fill='#C41E3A', anchor='w')
     
     def detection_loop(self):
         while self.running:
@@ -224,16 +224,35 @@ class DeathCounter:
                 self.add_death()
             time.sleep(0.2)
     
+    def _get_hwnd(self):
+        """Получить правильный HWND окна Tk"""
+        if self.hwnd:
+            return self.hwnd
+        
+        # Tk использует вложенные окна, нужен родительский HWND
+        try:
+            # Метод 1: через wm frame
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if hwnd == 0:
+                hwnd = self.root.winfo_id()
+            self.hwnd = hwnd
+        except:
+            self.hwnd = self.root.winfo_id()
+        
+        return self.hwnd
+    
     def create_overlay(self):
         self.root = tk.Tk()
+        self.root.title("Deaths")
         self.root.overrideredirect(True)
         self.root.attributes('-topmost', True)
         self.root.attributes('-transparentcolor', '#010101')
         self.root.configure(bg='#010101')
-        self.root.geometry('+50+50')
+        self.root.geometry('180x50+50+50')
         
         self.canvas = tk.Canvas(self.root, bg='#010101', highlightthickness=0,
-                                width=300, height=50)
+                                width=180, height=50)
         self.canvas.pack()
         self._redraw()
         
@@ -242,9 +261,8 @@ class DeathCounter:
         self.canvas.bind('<B1-Motion>', self._do_drag)
         self.canvas.bind('<Button-3>', self._reset)
         
-        if WIN32_OK:
-            self.root.after(100, self._setup_win)
-            self.root.after(500, self._keep_top)
+        # Настройка после отрисовки первого кадра
+        self.root.after(100, self._setup_win)
     
     def _do_drag(self, e):
         self.root.geometry(f'+{self.root.winfo_x() + e.x - self._drag["x"]}+{self.root.winfo_y() + e.y - self._drag["y"]}')
@@ -253,27 +271,81 @@ class DeathCounter:
         self.deaths = 0
         self.save()
         self.update_display()
-        print("[*] Сброс")
+        print("[*] Сброс счётчика")
     
     def _setup_win(self):
+        """Настроить окно для работы поверх полноэкранных игр"""
+        if not WIN32_OK:
+            self.root.after(100, self._keep_top_simple)
+            return
+        
         try:
-            hwnd = int(self.root.winfo_id())
-            styles = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE,
-                styles | win32con.WS_EX_LAYERED | win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_NOACTIVATE)
-            win32gui.SetLayeredWindowAttributes(hwnd, 0, 230, win32con.LWA_ALPHA)
-        except:
-            pass
+            hwnd = self._get_hwnd()
+            
+            # Получаем текущие стили
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            
+            # Добавляем стили:
+            # WS_EX_LAYERED - для прозрачности
+            # WS_EX_TOOLWINDOW - не показывать в таскбаре
+            # WS_EX_NOACTIVATE - не забирать фокус
+            # WS_EX_TOPMOST - поверх всех окон
+            new_style = (ex_style | 
+                        win32con.WS_EX_LAYERED | 
+                        win32con.WS_EX_TOOLWINDOW | 
+                        win32con.WS_EX_NOACTIVATE |
+                        win32con.WS_EX_TOPMOST)
+            
+            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, new_style)
+            
+            # Устанавливаем прозрачность
+            win32gui.SetLayeredWindowAttributes(hwnd, 0, 245, win32con.LWA_ALPHA)
+            
+            # Принудительно ставим поверх
+            win32gui.SetWindowPos(
+                hwnd, 
+                win32con.HWND_TOPMOST,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
+            )
+            
+            print("[+] Окно настроено для работы поверх игр")
+        except Exception as e:
+            print(f"[!] Ошибка настройки окна: {e}")
+        
+        # Запускаем цикл поддержания поверх
+        self.root.after(100, self._keep_top)
     
-    def _keep_top(self):
+    def _keep_top_simple(self):
+        """Простой метод поддержания поверх (без win32)"""
         if self.root and self.running:
             try:
-                hwnd = int(self.root.winfo_id())
-                win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+                self.root.attributes('-topmost', True)
+                self.root.lift()
             except:
                 pass
-            self.root.after(300, self._keep_top)
+            self.root.after(50, self._keep_top_simple)
+    
+    def _keep_top(self):
+        """Агрессивно поддерживать окно поверх игры"""
+        if not self.root or not self.running:
+            return
+        
+        try:
+            hwnd = self._get_hwnd()
+            
+            # Ставим окно поверх без изменения фокуса
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+            )
+        except:
+            pass
+        
+        # Проверяем каждые 50мс (20 раз в секунду)
+        self.root.after(50, self._keep_top)
     
     def run(self):
         print()
@@ -283,7 +355,7 @@ class DeathCounter:
         print()
         print(f"   Смертей: {self.deaths}")
         print()
-        print("   Детекция: экран + звук")
+        print("   Детекция: по шаблону (death.png)")
         print("   ПКМ на счётчике = сброс")
         print("   Ctrl+C = выход")
         print()
@@ -291,12 +363,11 @@ class DeathCounter:
         print()
         
         if not SCREEN_OK:
-            print("[!] mss/pillow не установлены")
-        if not SOUND_OK:
-            print("[!] sounddevice/numpy не установлены")
+            print("[!] Зависимости не установлены - запустите: uv sync")
+            return
         
-        if not SCREEN_OK and not SOUND_OK:
-            print("[!] Запустите: uv sync")
+        if not self.detector.templates:
+            print("[!] Файл death.png не найден! Положите его рядом с main.py")
             return
         
         print("[*] Слежу за смертями...")
