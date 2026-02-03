@@ -2,7 +2,7 @@
 Dark Souls Death Counter
 Автоматический счётчик смертей
 
-Детекция по шаблону - ищет картинку "ВЫ ПОГИБЛИ" (death.png) на экране.
+Детекция через OCR - ищет текст "ВЫ ПОГИБЛИ" на экране.
 """
 
 import tkinter as tk
@@ -14,8 +14,8 @@ from pathlib import Path
 
 try:
     import mss
-    import cv2
     import numpy as np
+    import easyocr
     SCREEN_OK = True
 except ImportError:
     SCREEN_OK = False
@@ -28,59 +28,37 @@ except ImportError:
     WIN32_OK = False
 
 SAVE_FILE = Path(__file__).parent / "death_count.json"
-TEMPLATE_FILE = Path(__file__).parent / "death.png"
 
 
 class DeathDetector:
-    """Детектор смерти по шаблону изображения"""
+    """Детектор смерти через OCR"""
     
     def __init__(self):
         self.last_death_time = 0
-        self.cooldown = 15.0  # Секунд паузы после смерти
+        self.cooldown = 10.0  # Секунд паузы после смерти
         self.in_cooldown = False  # Флаг кулдауна
         
-        # Загружаем шаблон в разных масштабах
-        self.templates = []  # Список (template, scale)
-        self.debug_mode = True  # Показывать отладку
+        # Инициализация OCR
+        self.reader = None
+        self.debug_mode = True
         self.debug_counter = 0
-        self._load_template()
+        self._init_ocr()
     
-    def _load_template(self):
-        """Загрузить шаблон изображения смерти в разных масштабах"""
+    def _init_ocr(self):
+        """Инициализировать OCR для русского языка"""
         if not SCREEN_OK:
             return
         
-        if not TEMPLATE_FILE.exists():
-            print(f"[!] Файл шаблона не найден: {TEMPLATE_FILE}")
-            return
-        
         try:
-            # Загружаем оригинальный шаблон
-            template_orig = cv2.imread(str(TEMPLATE_FILE), cv2.IMREAD_GRAYSCALE)
-            if template_orig is None:
-                print("[!] Не удалось загрузить шаблон")
-                return
-            
-            h, w = template_orig.shape
-            print(f"[+] Шаблон загружен: {w}x{h}")
-            
-            # Создаём шаблоны разных размеров (от 50% до 200%)
-            scales = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0]
-            for scale in scales:
-                new_w = int(w * scale)
-                new_h = int(h * scale)
-                if new_w > 10 and new_h > 10:
-                    resized = cv2.resize(template_orig, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    self.templates.append((resized, scale))
-            
-            print(f"[+] Создано {len(self.templates)} масштабов шаблона")
-            
+            print("[*] Загружаю OCR модель (первый раз может занять время)...")
+            self.reader = easyocr.Reader(['ru'], gpu=False, verbose=False)
+            print("[+] OCR готов!")
         except Exception as e:
-            print(f"[!] Ошибка загрузки шаблона: {e}")
+            print(f"[!] Ошибка инициализации OCR: {e}")
     
     def check_screen(self) -> bool:
-        """Проверить экран на наличие шаблона смерти"""
-        if not SCREEN_OK or not self.templates:
+        """Проверить экран на надпись ВЫ ПОГИБЛИ"""
+        if not SCREEN_OK or self.reader is None:
             return False
         
         try:
@@ -89,66 +67,48 @@ class DeathDetector:
                 width = monitor["width"]
                 height = monitor["height"]
                 
-                # Область поиска - только центр где появляется "ВЫ ПОГИБЛИ"
-                # Исключаем верхний UI (здоровье) и нижний UI (предметы, души)
+                # Область поиска - центр экрана где появляется надпись
                 region = {
-                    "left": int(width * 0.25),      # 25% слева
-                    "top": int(height * 0.35),      # 35% сверху
-                    "width": int(width * 0.5),      # 50% ширины (центр)
-                    "height": int(height * 0.20)    # 20% высоты (узкая полоса)
+                    "left": int(width * 0.2),
+                    "top": int(height * 0.30),
+                    "width": int(width * 0.6),
+                    "height": int(height * 0.25)
                 }
                 
                 # Делаем скриншот
                 screenshot = sct.grab(region)
-                
-                # Конвертируем в numpy array для OpenCV
                 img = np.array(screenshot)
                 
-                # Конвертируем BGRA -> Grayscale
-                gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+                # Распознаём текст
+                results = self.reader.readtext(img, detail=0, paragraph=False)
                 
-                best_val = 0
-                best_scale = 0
+                # Собираем весь текст
+                found_text = " ".join(results).upper()
                 
-                # Пробуем все масштабы шаблона
-                for template, scale in self.templates:
-                    # Проверяем что шаблон меньше изображения
-                    if template.shape[0] > gray.shape[0] or template.shape[1] > gray.shape[1]:
-                        continue
-                    
-                    # Ищем шаблон
-                    result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, _ = cv2.minMaxLoc(result)
-                    
-                    if max_val > best_val:
-                        best_val = max_val
-                        best_scale = scale
-                
-                # Отладка - показываем каждые 25 проверок (~5 сек)
+                # Отладка
                 if self.debug_mode:
                     self.debug_counter += 1
-                    if self.debug_counter >= 25:
+                    if self.debug_counter >= 10:  # Каждые ~2 сек
                         self.debug_counter = 0
-                        print(f"[DEBUG] Совпадение: {best_val:.1%} (масштаб {best_scale})")
+                        if results:
+                            print(f"[DEBUG] OCR нашёл: {results}")
                 
-                # Порог совпадения (повысил т.к. область теперь точнее)
-                threshold = 0.30  # 30%
-                
-                if best_val >= threshold:
-                    print(f"[!] Обнаружена смерть! Совпадение: {best_val:.1%}")
+                # Ищем именно "ВЫ ПОГИБЛИ"
+                if "ВЫ ПОГИБЛИ" in found_text or ("ВЫ" in found_text and "ПОГИБЛИ" in found_text):
+                    print(f"[!] Обнаружена смерть! Текст: {found_text}")
                     return True
                     
         except Exception as e:
-            print(f"[!] Ошибка проверки экрана: {e}")
+            print(f"[!] Ошибка OCR: {e}")
         
         return False
     
     def check_death(self) -> bool:
-        """Проверить смерть с простым кулдауном"""
+        """Проверить смерть с кулдауном"""
         current_time = time.time()
         time_since_death = current_time - self.last_death_time
         
-        # Кулдаун после смерти - игнорируем все проверки
+        # Кулдаун после смерти
         if self.in_cooldown:
             if time_since_death >= self.cooldown:
                 self.in_cooldown = False
@@ -159,7 +119,7 @@ class DeathDetector:
         if self.check_screen():
             self.last_death_time = current_time
             self.in_cooldown = True
-            print(f"[*] Пауза {int(self.cooldown)} сек (надпись на экране)...")
+            print(f"[*] Пауза {int(self.cooldown)} сек...")
             return True
         
         return False
@@ -355,7 +315,7 @@ class DeathCounter:
         print()
         print(f"   Смертей: {self.deaths}")
         print()
-        print("   Детекция: по шаблону (death.png)")
+        print("   Детекция: OCR (ищет текст ПОГИБЛИ)")
         print("   ПКМ на счётчике = сброс")
         print("   Ctrl+C = выход")
         print()
@@ -366,8 +326,8 @@ class DeathCounter:
             print("[!] Зависимости не установлены - запустите: uv sync")
             return
         
-        if not self.detector.templates:
-            print("[!] Файл death.png не найден! Положите его рядом с main.py")
+        if self.detector.reader is None:
+            print("[!] OCR не инициализирован!")
             return
         
         print("[*] Слежу за смертями...")
