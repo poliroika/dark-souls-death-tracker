@@ -1,0 +1,17 @@
+[project]
+name = "dark-souls-death-tracker"
+version = "1.0.0"
+description = "Счетчик смертей для Dark Souls Remastered с прозрачным оверлеем"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "pymem>=1.13.1",
+    "watchdog>=3.0.0",
+    "pywin32>=306",
+]
+
+[project.scripts]
+death-tracker = "main:main"
+
+[tool.uv]
+dev-dependencies = []
