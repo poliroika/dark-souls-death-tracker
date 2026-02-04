@@ -1,16 +1,11 @@
 [project]
 name = "dark-souls-death-tracker"
-version = "2.0.0"
-description = "Счетчик смертей для Dark Souls Remastered с прозрачным оверлеем"
+version = "3.0.0"
+description = "Оверлей для отображения счётчика смертей (работает с DSDeaths)"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
     "pywin32>=306",
-    "mss>=9.0.0",
-    "pillow>=10.0.0",
-    "opencv-python>=4.8.0",
-    "numpy>=1.24.0",
-    "easyocr>=1.7.0",
 ]
 
 [project.scripts]
